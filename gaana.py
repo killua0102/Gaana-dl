@@ -1,463 +1,251 @@
-#!/usr/bin/env python3
-import base64
-import json
-import sys
 import os
-import subprocess
+import sys
 import requests
 import re
+import base64
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
+import yt_dlp
+from mutagen.mp4 import MP4, MP4Cover
+from config import CONFIG
 
 
-# ===============================================================
-# COLORS
-# ===============================================================
+class GaanaDL:
+    REGEX = re.compile(r"https://gaana\.com/(song|album|playlist)/(.+)")
 
-class C:
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    DIM = '\033[2m'
+    @staticmethod
+    def sanitize_filename(filename: str) -> str:
+        # Characters that are invalid on Windows/Unix filesystems
+        invalid_chars = r'[<>:"/\\|?*\x00-\x1f]'
+        sanitized = re.sub(invalid_chars, '', filename)
+        sanitized = sanitized.rstrip('. ')
+        return sanitized
 
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-GB,en;q=0.9,en-US;q=0.8,it-IT;q=0.7,it;q=0.6',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'DNT': '1',
+            'Origin': 'https://gaana.com',
+            'Pragma': 'no-cache',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0',
+            'sec-ch-ua': '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+        })
 
-# ===============================================================
-# AES DECRYPTION
-# ===============================================================
+    def download_album(self, identifier):
+        album_data = self.session.post('https://gaana.com/apiv2', params={
+            'seokey': identifier,
+            'type': 'albumDetail',
+        }).json()
 
-def from_words(words):
-    return b"".join(w.to_bytes(4, byteorder="big", signed=True) for w in words)
+        album_metadata = {
+            'album_name': album_data['album']['title'],
+            'artist_name': album_data['album']['artist'][0]['name'],
+            "release_year": album_data['release_year'],
+            'track_count': album_data['album']['trackcount'],
+            'language': album_data['album']['language'],
+            'records': album_data['album']['recordlevel'],
+        }
 
+        sanitized_metadata = {k: self.sanitize_filename(
+            str(v)) for k, v in album_metadata.items()}
+        album_metadata['album_path'] = os.path.join(
+            CONFIG["download_path"], CONFIG["album_folder_format"].format(**sanitized_metadata))
 
-AES_KEY = from_words([1735995764, 593641578, 1814585892, 2004118885])
+        print(
+            """Album Info:
+            Name    : {album_name}
+            Artist  : {artist_name}
+            Year    : {release_year}
+            Tracks  : {track_count}
+            Language: {language}
+            Records : {records}
+            """.format(**album_metadata)
+        )
 
+        album_path = album_metadata['album_path']
+        os.makedirs(album_path, exist_ok=True)
+        for i, track in enumerate(album_data['tracks']):
+            track["track_number"] = str(i+1).zfill(2)
+            track['track_count'] = album_data['album']['trackcount']
+            track['album_path'] = album_path
+            track['label_name'] = album_data['album'].get('recordlevel', '')
+            self.download_song(track['seokey'], data=track)
 
-def decrypt_stream_path(stream_path: str) -> str:
-    offset = int(stream_path[0])
-    iv = stream_path[offset: offset + 16].encode("utf-8")
-    ciphertext = base64.b64decode(stream_path[offset + 16:])
-    cipher = AES.new(AES_KEY, AES.MODE_CBC, iv)
-    return unpad(cipher.decrypt(ciphertext), AES.block_size).decode("utf-8")
+    def download_playlist(self, identifier):
+        pass
 
+    def download_song(self, identifier, data=None):
+        if data is None:
+            data = self.session.post('https://gaana.com/apiv2', params={
+                'seokey': identifier,
+                'type': 'songDetail',
+            }).json()['tracks'][0]
 
-# ===============================================================
-# REDUX DATA EXTRACTOR
-# ===============================================================
+            song_metadata = {
+                'track_title': data['track_title'],
+                'artist_name': data['artist'][0]['name'],
+                'album_name': data['album_title'],
+            }
 
-def extract_redux_data(html: str) -> dict:
-    start = html.find("window.REDUX_DATA")
-    if start == -1:
-        raise ValueError("REDUX_DATA not found")
+            data["track_number"] = '01'
+            data["track_count"] = '01'
+            sanitized_song_metadata = {k: self.sanitize_filename(
+                str(v)) for k, v in song_metadata.items()}
+            data['album_path'] = os.path.join(
+                CONFIG["download_path"], CONFIG["album_folder_format"].format(**sanitized_song_metadata))
+            os.makedirs(song_metadata['album_path'], exist_ok=True)
 
-    brace_start = html.find("{", start)
-    if brace_start == -1:
-        raise ValueError("Opening brace not found")
+            print("""Song Info:
+            Title : {track_title}
+            Artist: {artist_name}
+            Album : {album_title}
+            """.format(**data))
 
-    brace_count = 0
-    json_str = ""
-    in_string = False
-    escape = False
-    string_char = None
+        print(f"Downloading: {data['track_number']} {data['track_title']}...")
 
-    for ch in html[brace_start:]:
-        json_str += ch
-        if escape:
-            escape = False
-            continue
-        if ch == "\\":
-            escape = True
-            continue
-        if not in_string:
-            if ch == '"':
-                in_string = True
-                string_char = '"'
-        elif ch == string_char:
-            in_string = False
-            string_char = None
-        if not in_string:
-            if ch == "{":
-                brace_count += 1
-            elif ch == "}":
-                brace_count -= 1
-                if brace_count == 0:
-                    break
+        artwork_path = os.path.join(data['album_path'], 'cover.jpg')
+        artwork_url = data['artwork'].replace(
+            'size_s', f"size_{CONFIG['artwork_quality']}")
 
-    return json.loads(json_str.replace("\\u002F", "/"))
+        # Download if cover.jpg does not exists
+        if not os.path.exists(artwork_path):
+            artwork_response = self.session.get(artwork_url)
+            with open(artwork_path, 'wb') as f:
+                f.write(artwork_response.content)
 
+        track_file_name = self.sanitize_filename(
+            CONFIG["track_file_format"].format(**data))
+        track_file_path = os.path.join(data['album_path'], track_file_name)
 
-# ===============================================================
-# THUMBNAIL EXTRACTION
-# ===============================================================
+        stream_url = self.decrypt_stream_path(data['urls']['auto']['message']).replace(
+            'f.mp4', f'{CONFIG["audio_quality"]}.mp4')
 
-def extract_thumbnail_url(html: str) -> str:
-    """Extract thumbnail URL from HTML meta tags or img tag"""
-    # Try og:image first (best quality)
-    og_pattern = r'<meta[^>]*property=["\']og:image["\'][^>]*content=["\'](https://[^"\']*)["\']'
-    match = re.search(og_pattern, html)
-    if match:
-        return match.group(1)
-    
-    # Try twitter:image
-    tw_pattern = r'<meta[^>]*name=["\']twitter:image["\'][^>]*content=["\'](https://[^"\']*)["\']'
-    match = re.search(tw_pattern, html)
-    if match:
-        return match.group(1)
-    
-    # Fallback to img tag
-    img_pattern = r'<img src="(https://[^"]*gaanacdn\.com/[^"]*)"[^>]*alt="[^"]*"'
-    match = re.search(img_pattern, html)
-    if match:
-        return match.group(1)
-    
-    return None
+        if os.path.exists(track_file_path):
+            print(f"File already exists: {track_file_path}")
+            return
 
+        self.download_stream(stream_url, track_file_path)
+        self.tag_track(track_file_path, data, artwork_path)
 
-def get_track_thumbnail(track: dict) -> str:
-    """Get thumbnail URL from track data"""
-    # Try artworkLink first (higher quality)
-    artwork = track.get("artworkLink") or track.get("artwork")
-    if artwork:
-        return artwork
-    
-    # Try artwork_large, artwork_medium
-    for key in ["artwork_large", "artwork_web", "artwork"]:
-        if track.get(key):
-            return track[key]
-    
-    return None
+    def download_stream(self, stream_url, file_path):
+        ydl_opts = {
+            'format': 'best',
+            'outtmpl': file_path,
+            'quiet': True,
+            'no_warnings': True,
+            'noprogress': True,
+        }
 
-
-def download_thumbnail(url: str, output_path: str) -> bool:
-    """Download thumbnail image"""
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        with open(output_path, 'wb') as f:
-            f.write(resp.content)
-        return True
-    except Exception as e:
-        return False
-
-
-# ===============================================================
-# DATA EXTRACTION
-# ===============================================================
-
-def find_tracks(obj, tracks=None):
-    if tracks is None:
-        tracks = []
-    if isinstance(obj, dict):
-        if "track_title" in obj and "urls" in obj:
-            tracks.append(obj)
-        for v in obj.values():
-            find_tracks(v, tracks)
-    elif isinstance(obj, list):
-        for item in obj:
-            find_tracks(item, tracks)
-    return tracks
-
-
-def get_main_track(redux: dict):
-    song = redux.get("song", {}).get("songDetail", {})
-    if song and "track_title" in song and "urls" in song:
-        return [song]
-    tracks = redux.get("song", {}).get("tracks", [])
-    if tracks and len(tracks) > 0:
-        first_track = tracks[0]
-        if "track_title" in first_track and "urls" in first_track:
-            return [first_track]
-    return None
-
-
-def get_collection_name(redux: dict) -> str:
-    pl_detail = redux.get("playlist", {}).get("playlistDetail", {})
-    nested_pl = pl_detail.get("playlist", {})
-    if nested_pl.get("title"):
-        return str(nested_pl["title"])
-    for k in ("title", "playlist_title", "playlistTitle", "name"):
-        if pl_detail.get(k):
-            return str(pl_detail[k])
-    album = redux.get("album", {}).get("albumDetail", {})
-    for k in ("title", "album_title", "name"):
-        if album.get(k):
-            return str(album[k])
-    song = redux.get("song", {}).get("songDetail", {})
-    for k in ("title", "track_title", "name"):
-        if song.get(k):
-            return str(song[k])
-    tracks = redux.get("song", {}).get("tracks", [])
-    if tracks and len(tracks) > 0:
-        return tracks[0].get("track_title", "Unknown")
-    return "Unknown"
-
-
-def get_quality_url(track, quality_key):
-    """Get URL for specified quality"""
-    urls = track.get("urls") or {}
-    url_entry = urls.get(quality_key)
-    
-    if url_entry and url_entry.get("message"):
         try:
-            url = decrypt_stream_path(url_entry["message"])
-            
-            # For auto quality, replace 'f' with '320'
-            if quality_key == "auto":
-                url = url.replace("/f.mp4.master.m3u8", "/320.mp4.master.m3u8")
-            
-            return url
-        except:
-            pass
-    
-    return None
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([stream_url])
+        except Exception as e:
+            print(f"Error: {e}")
 
+    @staticmethod
+    def decrypt_stream_path(encrypted_path) -> str:
+        AES_KEY = b"".join(w.to_bytes(4, byteorder="big", signed=True)
+                           for w in [1735995764, 593641578, 1814585892, 2004118885])
+        offset = int(encrypted_path[0])
+        iv = encrypted_path[offset: offset + 16].encode("utf-8")
+        ciphertext = base64.b64decode(encrypted_path[offset + 16:])
+        cipher = AES.new(AES_KEY, AES.MODE_CBC, iv)
+        return unpad(cipher.decrypt(ciphertext), AES.block_size).decode("utf-8")
 
-def sanitize_filename(name: str) -> str:
-    bad = ['/', '\\', ':', '|', '?', '*', '<', '>', '"', "'"]
-    for b in bad:
-        name = name.replace(b, "_")
-    return name.strip()
+    @staticmethod
+    def tag_track(file_path, metadata, artwork_path):
+        try:
+            audio = MP4(file_path)
+            audio.clear()
 
+            audio["\xa9nam"] = metadata.get("track_title", "")  # Title
+            audio["\xa9alb"] = metadata.get("album_title", "")  # Album
 
-def embed_thumbnail(mp3_path: str, thumbnail_path: str, title: str, artist: str, album: str):
-    """Embed thumbnail and metadata into MP3 using ffmpeg"""
-    temp_output = mp3_path + ".temp.mp3"
-    try:
-        cmd = [
-            "ffmpeg",
-            "-i", mp3_path,
-            "-i", thumbnail_path,
-            "-map", "0:a",
-            "-map", "1:0",
-            "-c:a", "copy",
-            "-c:v", "mjpeg",
-            "-disposition:v", "attached_pic",
-            "-metadata", f"title={title}",
-            "-metadata", f"artist={artist}",
-            "-metadata", f"album={album}",
-            "-y",
-            temp_output
-        ]
-        
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        
-        # Replace original with embedded version
-        if os.path.exists(temp_output):
-            os.replace(temp_output, mp3_path)
-            return True
-        return False
-    except subprocess.CalledProcessError as e:
-        print(f"\n{C.RED}FFmpeg error:{C.ENDC} {e.stderr}")
-        # Clean up temp file if it exists
-        if os.path.exists(temp_output):
+            # Artist(s)
+            if metadata.get("artist"):
+                artists = [artist["name"] for artist in metadata["artist"]]
+                audio["\xa9ART"] = artists[0] if len(artists) == 1 else artists
+                audio["aART"] = artists[0]  # Album Artist
+
+            # Genre(s)
+            if metadata.get("gener"):  # Note: typo in JSON key
+                genres = [genre["name"] for genre in metadata["gener"]]
+                audio["\xa9gen"] = genres[0] if len(genres) == 1 else genres
+
+            if metadata.get("release_date"):
+                audio["\xa9day"] = metadata["release_date"]
+
+            if metadata.get("isrc"):
+                audio["----:com.apple.iTunes:ISRC"] = metadata["isrc"].encode(
+                    'utf-8')
+
+            if metadata.get("language"):
+                audio["----:com.apple.iTunes:LANGUAGE"] = metadata["language"].encode(
+                    'utf-8')
+
+            if metadata.get("label_name"):
+                audio["cprt"] = metadata["label_name"]
+
+            if metadata.get("track_number"):
+                audio["trkn"] = [
+                    (int(metadata["track_number"]), int(metadata.get("track_count", 0)))]
+
+            if "parental_warning" in metadata:
+                audio["rtng"] = [1 if metadata["parental_warning"] else 2]
+
+            audio['stik'] = [1]  # Music
+
+            # Loudness metadata (ReplayGain/iTunes Sound Check equivalent)
+            if metadata.get("loudness"):
+                loudness = metadata["loudness"]
+                audio["----:com.apple.iTunes:REPLAYGAIN_TRACK_GAIN"] = f"{loudness.get('integrated', '')}".encode(
+                    'utf-8')
+                audio["----:com.apple.iTunes:REPLAYGAIN_TRACK_PEAK"] = f"{loudness.get('truePeak', '')}".encode(
+                    'utf-8')
+                audio["----:com.apple.iTunes:REPLAYGAIN_TRACK_RANGE"] = f"{loudness.get('lra', '')}".encode(
+                    'utf-8')
+
             try:
-                os.remove(temp_output)
-            except:
-                pass
-        return False
-    except Exception as e:
-        print(f"\n{C.RED}Embed error:{C.ENDC} {str(e)}")
-        # Clean up temp file if it exists
-        if os.path.exists(temp_output):
-            try:
-                os.remove(temp_output)
-            except:
-                pass
-        return False
+                with open(artwork_path, 'rb') as f:
+                    artwork_data = f.read()
+                    audio["covr"] = [
+                        MP4Cover(artwork_data, imageformat=MP4Cover.FORMAT_JPEG)]
+            except Exception as e:
+                print(f"Failed to embed artwork: {e}")
+
+            # audio["\xa9cmt"] = "Gaana-dl"
+            audio.save()
+
+        except Exception as e:
+            print(f"Error tagging file: {e}")
+            raise
 
 
-def download_with_ytdlp(url: str, output_path: str, title: str, artist: str, album: str, thumbnail_url: str, output_dir: str):
-    """Download audio"""
-    try:
-        # Download audio with progress
-        cmd = [
-            "yt-dlp",
-            "-x",
-            "--audio-format", "mp3",
-            "--audio-quality", "0",
-            "--progress",
-            "--newline",
-            "-o", output_path,
-            url
-        ]
-        
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        
-        for line in process.stdout:
-            line = line.strip()
-            if line:
-                # Check for download progress
-                if '[download]' in line and '%' in line:
-                    # Extract percentage
-                    if 'of' in line:
-                        parts = line.split()
-                        for i, part in enumerate(parts):
-                            if '%' in part:
-                                percent = part.strip('%')
-                                try:
-                                    pct = float(percent)
-                                    bar_length = 30
-                                    filled = int(bar_length * pct / 100)
-                                    bar = '█' * filled + '░' * (bar_length - filled)
-                                    print(f"\r{C.YELLOW}⟳{C.ENDC} {title}: [{bar}] {pct:.1f}%", end='', flush=True)
-                                except:
-                                    pass
-                                break
-                elif '[ExtractAudio]' in line or 'Deleting original file' in line:
-                    print(f"\r{C.YELLOW}⟳{C.ENDC} {title}: Converting to MP3...{' '*20}", end='', flush=True)
-        
-        process.wait()
-        
-        if process.returncode != 0:
-            return False
-        
-        # Find the actual output file
-        base_name = os.path.splitext(output_path)[0]
-        mp3_file = base_name + ".mp3"
-        
-        if not os.path.exists(mp3_file):
-            return False
-        
-        return True
-    except Exception as e:
-        print(f"\n{C.RED}Error:{C.ENDC} {str(e)}")
-        return False
-
-
-# ===============================================================
-# MAIN
-# ===============================================================
-
-def main():
-    print(f"""{C.CYAN}{C.BOLD}
-  ▒▒▒▒▒▒╗  ▒▒▒▒▒╗  ▒▒▒▒▒╗ ▒▒▒╗   ▒▒╗ ▒▒▒▒▒╗ 
- ▒▒╔═══╝ ▒▒╔══▒▒╗▒▒╔══▒▒╗▒▒▒▒╗  ▒▒║▒▒╔══▒▒╗
- ▒▒║  ▒▒▒╗▒▒▒▒▒▒▒║▒▒▒▒▒▒▒║▒▒╔▒▒╗ ▒▒║▒▒▒▒▒▒▒║
- ▒▒║   ▒▒║▒▒╔══▒▒║▒▒╔══▒▒║▒▒║╚▒▒╗▒▒║▒▒╔══▒▒║
- ╚▒▒▒▒▒▒╔╝▒▒║  ▒▒║▒▒║  ▒▒║▒▒║ ╚▒▒▒▒║▒▒║  ▒▒║
-  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝
-            DOWNLOADER v3.0{C.ENDC}
-""")
-    
-    url = input(f"{C.BOLD}URL:{C.ENDC} ").strip()
-    if not url:
-        print(f"{C.RED}✗ No URL{C.ENDC}")
-        return
-    
-    print(f"\n{C.YELLOW}⟳{C.ENDC} Fetching...", end="", flush=True)
-    
-    try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        resp.raise_for_status()
-        html = resp.text
-        redux = extract_redux_data(html)
-        thumbnail_url = extract_thumbnail_url(html)
-        
-        is_song_page = "/song/" in url
-        
-        if is_song_page:
-            tracks = get_main_track(redux)
-            if not tracks:
-                all_tracks = find_tracks(redux)
-                tracks = [all_tracks[0]] if all_tracks else []
-        else:
-            tracks = find_tracks(redux)
-        
-        collection_name = get_collection_name(redux)
-        
-        if collection_name == "Unknown":
-            url_parts = url.rstrip('/').split('/')
-            if len(url_parts) > 0:
-                collection_name = url_parts[-1].replace('-', ' ').title()
-        
-        print(f"\r{C.GREEN}✓{C.ENDC} Fetched: {C.CYAN}{collection_name}{C.ENDC} ({len(tracks)} tracks)")
-    except Exception as e:
-        print(f"\r{C.RED}✗{C.ENDC} Error: {e}")
-        return
-    
-    if not tracks:
-        print(f"{C.RED}✗ No tracks{C.ENDC}")
-        return
-    
-    # Show tracks
-    print()
-    for i, t in enumerate(tracks, 1):
-        title = t.get("track_title", "Unknown")
-        artists = ", ".join(a.get("name", "") for a in t.get("artist", []))
-        print(f"  {C.DIM}{i:2d}.{C.ENDC} {title} {C.DIM}[{artists}]{C.ENDC}")
-    
-    # Select tracks
-    print(f"\n{C.BOLD}Select:{C.ENDC} {C.DIM}(1,3,5 or 'all' or Enter=all){C.ENDC}")
-    sel = input(f"{C.BOLD}Choice:{C.ENDC} ").strip().lower()
-    
-    if not sel or sel == "all":
-        indices = list(range(len(tracks)))
-    else:
-        indices = []
-        for part in sel.split(","):
-            try:
-                n = int(part.strip())
-                if 1 <= n <= len(tracks):
-                    indices.append(n - 1)
-            except:
-                pass
-    
-    if not indices:
-        print(f"{C.RED}✗ No selection{C.ENDC}")
-        return
-    
-    # Choose quality
-    print(f"\n{C.BOLD}Quality:{C.ENDC}")
-    print(f"  {C.DIM}1.{C.ENDC} 320 kbps")
-    print(f"  {C.DIM}2.{C.ENDC} 128 kbps")
-    print(f"  {C.DIM}3.{C.ENDC} 64 kbps")
-    quality = input(f"{C.BOLD}Choice:{C.ENDC} ").strip()
-    
-    quality_map = {"1": "auto", "2": "high", "3": "medium"}
-    quality_key = quality_map.get(quality, "auto")
-    
-    output_dir = f"downloads/{sanitize_filename(collection_name)}"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    print(f"\n{C.YELLOW}⟳{C.ENDC} Downloading {len(indices)} track(s)...\n")
-    
-    for idx in indices:
-        track = tracks[idx]
-        title = track.get("track_title", "Unknown")
-        artists = ", ".join(a.get("name", "") for a in track.get("artist", []))
-        album = track.get("album_title", "")
-        
-        # Try to get track-specific thumbnail first, fallback to page thumbnail
-        track_thumbnail = get_track_thumbnail(track)
-        thumb_to_use = track_thumbnail if track_thumbnail else thumbnail_url
-        
-        url_to_download = get_quality_url(track, quality_key)
-        
-        if not url_to_download:
-            print(f"{C.RED}✗{C.ENDC} {title} - No URL")
-            continue
-        
-        safe_title = sanitize_filename(f"{title} - {artists}")
-        output_path = f"{output_dir}/{safe_title}.%(ext)s"
-        
-        print(f"{C.YELLOW}⟳{C.ENDC} {title}...", end="", flush=True)
-        
-        if download_with_ytdlp(url_to_download, output_path, title, artists, album, thumb_to_use, output_dir):
-            print(f"\r{C.GREEN}✓{C.ENDC} {title}")
-        else:
-            print(f"\r{C.RED}✗{C.ENDC} {title}")
-    
-    print(f"\n{C.GREEN}✓{C.ENDC} Done! Saved to: {C.YELLOW}{output_dir}{C.ENDC}\n")
-
+LOGO = "  /$$$$$$                                                        /$$ /$$\r\n /$$__  $$                                                      | $$| $$\r\n| $$  \\__/  /$$$$$$   /$$$$$$  /$$$$$$$   /$$$$$$           /$$$$$$$| $$\r\n| $$ /$$$$ |____  $$ |____  $$| $$__  $$ |____  $$ /$$$$$$ /$$__  $$| $$\r\n| $$|_  $$  /$$$$$$$  /$$$$$$$| $$  \\ $$  /$$$$$$$|______/| $$  | $$| $$\r\n| $$  \\ $$ /$$__  $$ /$$__  $$| $$  | $$ /$$__  $$        | $$  | $$| $$\r\n|  $$$$$$/|  $$$$$$$|  $$$$$$$| $$  | $$|  $$$$$$$        |  $$$$$$$| $$\r\n \\______/  \\_______/ \\_______/|__/  |__/ \\_______/         \\_______/|__/\n\n"
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print(f"\n{C.YELLOW}⚠ {C.ENDC} Interrupted")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n{C.RED}✗{C.ENDC} Error: {e}")
-        sys.exit(1)
+    print(LOGO)
+    urls_list = sys.argv[1:]
+    gaana_dl = GaanaDL()
+    for url in urls_list:
+        result = GaanaDL.REGEX.match(url)
+        if not result:
+            print(f"Invalid URL: {url}")
+            continue
+        content_type, identifier = result.groups()
+        if content_type == "song":
+            gaana_dl.download_song(identifier)
+        elif content_type == "album":
+            gaana_dl.download_album(identifier)
+        elif content_type == "playlist":
+            gaana_dl.download_playlist(identifier)
