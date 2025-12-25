@@ -11,7 +11,8 @@ from config import CONFIG
 
 
 class GaanaDL:
-    REGEX = re.compile(r"https://gaana\.com/(song|album|playlist)/(.+)")
+    REGEX = re.compile(
+        r"https://gaana\.com/(song|album|playlist|podcast)/(.+)")
 
     @staticmethod
     def sanitize_filename(filename: str) -> str:
@@ -42,10 +43,10 @@ class GaanaDL:
         })
 
     def metadata_handler(self, identifier, metadata_type):
-            return self.session.post('https://gaana.com/apiv2', params={
-                'seokey': identifier,
-                'type': metadata_type,
-            }).json()
+        return self.session.post('https://gaana.com/apiv2', params={
+            'seokey': identifier,
+            'type': metadata_type,
+        }).json()
 
     def album_folder_handler(self, album_data):
         album_metadata = {
@@ -64,18 +65,33 @@ class GaanaDL:
         os.makedirs(album_metadata['album_path'], exist_ok=True)
         return album_metadata
 
-    def download_handler(self,content_type,identifier):
+    def playlist_folder_handler(self, playlist_data):
+        playlist_metadata = {
+            'album_name': playlist_data['playlist']['title'],
+            'artist_name': playlist_data['playlist']['createdby'],
+            'track_count': playlist_data['playlist']['trackcount'],
+        }
+
+        sanitized_metadata = {k: self.sanitize_filename(
+            str(v)) for k, v in playlist_metadata.items()}
+        playlist_metadata['album_path'] = os.path.join(
+            CONFIG["download_path"], "{artist_name} - {album_name}".format(**sanitized_metadata))
+        os.makedirs(playlist_metadata['album_path'], exist_ok=True)
+        return playlist_metadata
+
+    def download_handler(self, content_type, identifier):
         if content_type == "song":
             metadata_type = 'songDetail'
-            data = self.metadata_handler(identifier,metadata_type)
+            data = self.metadata_handler(identifier, metadata_type)
             self.download_song(data['tracks'][0])
-        elif content_type == "album":
+        elif content_type in ["album", "podcast"]:
             metadata_type = 'albumDetail'
             data = self.metadata_handler(identifier, metadata_type)
             self.download_album(data)
-        #WIP
         elif content_type == "playlist":
-            self.download_playlist(identifier)
+            metadata_type = 'playlistDetail'
+            data = self.metadata_handler(identifier, metadata_type)
+            self.download_playlist(data)
 
     def download_album(self, album_data):
         album_metadata = self.album_folder_handler(album_data)
@@ -92,32 +108,46 @@ class GaanaDL:
         )
 
         for i, track in enumerate(album_data['tracks']):
-            track_data = self.metadata_handler(track['seokey'],'songDetail')['tracks'][0]
+            track_data = track
             track_data["track_number"] = str(i + 1).zfill(2)
-            track_data['track_count'] = album_data['album']['trackcount']
+            track_data['track_count'] = album_metadata['track_count']
             track_data['album_path'] = album_metadata['album_path']
-            track_data['label_name'] = album_data['album'].get('recordlevel', '')
-            self.download_song(track_data, album_data,album_metadata)
+            track_data['label_name'] = album_metadata.get('records', '')
+            self.download_song(track_data, album_data_embedded=True)
 
-    def download_playlist(self, identifier):
-        pass
+    def download_playlist(self, playlist_data):
+        playlist_metadata = self.playlist_folder_handler(playlist_data)
+        print(
+            """Playlist Info:
+            Name    : {album_name}
+            Created By : {artist_name}
+            Tracks  : {track_count}
+            """.format(**playlist_metadata)
+        )
+        for i, track in enumerate(playlist_data['tracks']):
+            track_data = track
+            track_data["track_number"] = str(i + 1).zfill(2)
+            track_data['track_count'] = playlist_metadata['track_count']
+            track_data['album_path'] = playlist_metadata['album_path']
+            self.download_song(
+                track_data, album_data_embedded=True, is_playlist=True)
 
-    def download_song(self, data, album_data=None,album_metadata=None):
-        if not album_data and not album_metadata:
-            album_data = self.metadata_handler(data['albumseokey'],'albumDetail')
-            album_metadata =  self.album_folder_handler(album_data)
-            data["track_number"] = '01'
+    def download_song(self, data, album_data_embedded: bool = False, is_playlist: bool = False):
+        if not album_data_embedded:
+            album_data = self.metadata_handler(
+                data['albumseokey'], 'albumDetail')
+            album_metadata = self.album_folder_handler(album_data)
             for i, track in enumerate(album_data['tracks']):
                 if track['track_id'] == data['track_id']:
                     data["track_number"] = str(i + 1).zfill(2)
                     break
             data["track_count"] = album_metadata['track_count']
+            data['album_path'] = album_metadata['album_path']
 
         song_metadata = {
             'track_title': data['track_title'],
             'artist_name': data['artist'][0]['name'],
-            'album_name': data['album_title'],
-            "release_year": album_data['release_year'], #song api data doesn't have release_year key
+            'album_name': data['album_title']
         }
 
         print("""Song Info:
@@ -128,7 +158,7 @@ class GaanaDL:
 
         print(f"Downloading: {data['track_number']} {data['track_title']}...")
 
-        artwork_path = os.path.join(album_metadata['album_path'], 'cover.jpg')
+        artwork_path = os.path.join(data['album_path'], 'cover.jpg')
         artwork_url = data['artwork'].replace(
             'size_s', f"size_{CONFIG['artwork_quality']}")
 
@@ -140,7 +170,7 @@ class GaanaDL:
 
         track_file_name = self.sanitize_filename(
             CONFIG["track_file_format"].format(**data))
-        track_file_path = os.path.join(album_metadata['album_path'], track_file_name)
+        track_file_path = os.path.join(data['album_path'], track_file_name)
 
         stream_url = self.decrypt_stream_path(data['urls']['auto']['message']).replace(
             'f.mp4', f'{CONFIG["audio_quality"]}.mp4')
@@ -151,6 +181,9 @@ class GaanaDL:
 
         self.download_stream(stream_url, track_file_path)
         self.tag_track(track_file_path, data, artwork_path)
+
+        if is_playlist:
+            os.remove(artwork_path)
 
     def download_stream(self, stream_url, file_path):
         ydl_opts = {
@@ -258,4 +291,4 @@ if __name__ == "__main__":
             print(f"Invalid URL: {url}")
             continue
         content_type, identifier = result.groups()
-        gaana_dl.download_handler(content_type,identifier)
+        gaana_dl.download_handler(content_type, identifier)
