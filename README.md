@@ -1,5 +1,5 @@
 # Gaana-dl
-Music and album downloader for Gaana.com
+Music, album, playlist and podcasts downloader for Gaana.com
 
 ### How to use?
 Make sure you have [python](https://www.python.org/ "python") installed in your system.
@@ -17,10 +17,6 @@ python gaana.py https://gaana.com/album/bad-girls-like-you-english-version https
 ```
 Quality and download path can be changed from `config.py` file.     
 The files will be save in the ``Gaana-dl/Downloads/`` directory
-
-#### To-do
-[ ] Playlists support      
-[ ] Podcasts support
 
 
 If you find this tool helpful, please give it a ⭐ on GitHub!    
